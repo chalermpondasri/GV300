@@ -5,14 +5,21 @@ var pg = require('pg');
 //var cluster = require('cluster');
 //var numCPUs = require('os').cpus().length;
 var relayPort = 6543;
-var connectionInfo =
-        {
-            user: 'postgres',
-            password: 'password',
-            database: 'gv300',
-            host: 'localhost',
-            port: 5432
-        };
+var ConnectionInfo = {
+    user: 'postgres',
+    password: 'password',
+    database: 'gv300',
+    host: 'localhost',
+    port: 5432
+};
+
+var GatewayInfo = {
+    address: '58.64.30.187',
+    port: 30170
+};
+
+var dataIDArray = new Array();
+
 //--------------------- Main Entry ----------------------
 var socket = datagram.createSocket('udp4');
 socket.on('error', function(error) {
@@ -23,24 +30,29 @@ socket.on('message', function(msg, rInfo) {
     console.log('');
     var message = msg.toString();
     Utils.log(message);
-
-    if (rInfo.address === '127.0.0.1') {
-        test(message);
-    } else {
-        dataPacketHandler(message, rInfo, function(result) {
-            console.log(result);
-        });
-    }
+    dataPacketHandler(message, rInfo, function(result) {
+        //console.log(result);
+    });
 });
 socket.on('close', function() {
     console.log('Connection Close');
 });
 socket.on('listening', function() {
     var address = socket.address();
-    console.log(process.pid + ' Listening on ' + address.address + ':' + address.port);
+    Utils.log('PID:' + process.pid + ' : Listening on ' + address.address + ':' + address.port);
 });
 socket.bind(relayPort);
-
+/**
+ * Log the message into the database table name `logs`
+ * @param {type} imei
+ * @param {type} message
+ * @returns {undefined}
+ */
+function pg_log(imei, message) {
+    var sql = "INSERT INTO logs(imei, data)VALUES ('" + imei + "',  '" + message + "');";
+    pg_connectAndQuery(sql, function(message, result) {
+    });
+}
 
 /**
  * Data hadler function
@@ -52,129 +64,139 @@ socket.bind(relayPort);
 function dataPacketHandler(message, remoteInfo, callback) {
     var tmp = new Array();
     tmp = message.substr(0, message.length - 1).split(',');
-    // - DEV -  packet viewer - - - - - -
+    var packetInfo = new Array();
+    packetInfo.HEX = parseInt(tmp[4], 16);
+    packetInfo.IMEI = tmp[2];
+    pg_log(packetInfo.IMEI, message);
+
+    // - - DEV - - packet viewer - - - - -
     for (var i = 0; i < tmp.length; i++) {
         console.log(i + ' : ' + tmp[i]);
     }
     // - - - - - - - - - - - - - - - - - -
-    var packetInfo = new Array();
-    packetInfo.HEX = parseInt(tmp[4], 16);
-    packetInfo.IMEI = tmp[2];
-    switch (packetInfo.HEX) {
-        case 0x0000:
-            // Greeting from Garmin
-            Utils.log('Got Fixed Time Report');
-            packetInfo.DRIVER_ID = tmp[18];
-            packetInfo.DRIVER_ID_CHANGED_TIME = tmp[19];
-            packetInfo.STATUS_ID = tmp[21];
-            packetInfo.STATUS_ID_CHANGED_TIME = tmp[22];
-            packetInfo.SEND_TIME = tmp[36];
 
-            //----- Unuse -----
-            packetInfo.GPS_FIX = tmp[6];
-            packetInfo.SPEED = tmp[7]; //kmph
-            packetInfo.AZIMUTH = tmp[8];
-            packetInfo.ALTITUDE = tmp[9]; //m
-            packetInfo.LONGITUDE = tmp[10];
-            packetInfo.LATITUDE = tmp[11];
-            packetInfo.GPS_UTC_TIME = tmp[12];
-            packetInfo.ETA_ID = tmp[13];
-            packetInfo.ETA_TIME = tmp[14];
-            packetInfo.DIST_TO_DEST = tmp[15];// m
-            packetInfo.DEST_LONGITUDE = tmp[16];
-            packetInfo.DEST_LATITUDE = tmp[17];
-            packetInfo.DRIVER_INDEX = tmp[20];
+    if (tmp[0] === '+BUFF:GTFMI') {
+        // Currently ignore the buffered data
+        return;
+    } else if (tmp[0] === '+ACK:GTFMI' && dataIDArray[packetInfo.IMEI]) {
+        console.log('ACK to: ' + dataIDArray[packetInfo.IMEI].packet_id);
+        (dataIDArray[packetInfo.IMEI].packet_id)++;
+        deleteSentQueuedCommand(dataIDArray[packetInfo.IMEI].sql_id);
+        sendFirstQueuedCommand(packetInfo.IMEI);
+    } else if (tmp[0] === "+RESP:GTFMI") {
+        switch (packetInfo.HEX) {
+            case 0x0000:
+                // Fixed-Time Reporting
+                Utils.log('Got Fixed Time Report');
+                packetInfo.DRIVER_ID = tmp[18];
+                packetInfo.DRIVER_ID_CHANGED_TIME = tmp[19];
+                packetInfo.STATUS_ID = tmp[21];
+                packetInfo.STATUS_ID_CHANGED_TIME = tmp[22];
+                packetInfo.SEND_TIME = tmp[36];
+                //----- Unuse -----
+                packetInfo.GPS_FIX = tmp[6];
+                packetInfo.SPEED = tmp[7]; //kmph
+                packetInfo.AZIMUTH = tmp[8];
+                packetInfo.ALTITUDE = tmp[9]; //m
+                packetInfo.LONGITUDE = tmp[10];
+                packetInfo.LATITUDE = tmp[11];
+                packetInfo.GPS_UTC_TIME = tmp[12];
+                packetInfo.ETA_ID = tmp[13];
+                packetInfo.ETA_TIME = tmp[14];
+                packetInfo.DIST_TO_DEST = tmp[15]; // m
+                packetInfo.DEST_LONGITUDE = tmp[16];
+                packetInfo.DEST_LATITUDE = tmp[17];
+                packetInfo.DRIVER_INDEX = tmp[20];
+                updateBoxInfo(packetInfo);
+                // ------- sending queued command
+                if (!dataIDArray[packetInfo.IMEI]) {
+                    dataIDArray[packetInfo.IMEI] = new Array();
+                    dataIDArray[packetInfo.IMEI].packet_id = 1;
+                    dataIDArray[packetInfo.IMEI].sql_id = 0;
+                }
+                sendFirstQueuedCommand(packetInfo.IMEI);
 
-            updateBoxInfo(packetInfo);
-            break;
-
-        case 0x0823:// Set Driver Status Receipt Report
-            Utils.log('Got Driver Status Update');
-
-            packetInfo.STATUS_ID = tmp[5];
-            packetInfo.CHANGED_TIME = tmp[6];
-            packetInfo.SEND_TIME = tmp[17];
-            updateStatus(packetInfo);
-            break;
-
-        case 0x0813:// A607 Driver ID Update
-            Utils.log('Got A607 Driver ID Update');
-            packetInfo.DRIVER_ID = tmp[5];
-            packetInfo.DRIVER_ID_CHANGED_TIME = tmp[6];
-            packetInfo.SEND_TIME = tmp[17];
-            updateDriverID(packetInfo);
-            break;
-
-        case 0x0802:// Set Driver Status List Text Receipt Report
-            Utils.log('Got Driver Status List Receipt');
-            packetInfo.STATUS_ID = tmp[5];
-            packetInfo.RESULT = tmp[6];
-            Utils.log((packetInfo.RESULT === 1) ? 'SUCCESS' : 'FAIL');
-            break;
-
-        case 0x0261:// Communication Link Status Report
-            Utils.log('Got Communication Link Report');
-            packetInfo.LINK_STATUS = tmp[6];
-            Utils.log('Link Status: ' + (packetInfo.LINK_STATUS === 1 ? 'Established' : 'Lost'));
-            break;
-
-        case 0x0020:// Text Message ACK Report
-            // TODO write Text Message ACK Report hander here
-            Utils.log('Got Text Message ACK Report');
-            break;
-
-        case 0x0026:// A607 Client to Server Text Message
-            // TODO write A607 Client to Server Text Message handler here
-            Utils.log('Got A607 Client to Server Text Message');
-            break;
-
-        case 0x002B:// A604 Text Message Receipt Report
-            // TODO write A604 Text Message Receipt Report  handler here
-            Utils.log('Got A604 Text Message Receipt Report');
-            packetInfo.MESSAGE_ID = tmp[5];
-            packetInfo.WRITE_STATUS = tmp[6];
-            packetInfo.SEND_TIME = tmp[17];
-            updateSentMessageStatus(packetInfo);
-            break;
-
-        case 0x0041:// Text Message Status Report 
-            // TODO write Text Message Status Report handler here
-            Utils.log('Got Text Message Status Report ');
-            break;
-
-        case 0x0211:// Stop Status Report
-            Utils.log('Got Stop Status Report');
-            packetInfo.STOP_ID = tmp[5];
-            packetInfo.STOP_STATUS = tmp[6];
-            packetInfo.SEND_TIME = tmp[17];
-            updateStopStatus(packetInfo);
-            break;
-
+                break;
+            case 0x0823:// Set Driver Status Receipt Report
+                Utils.log('Got Driver Status Update');
+                packetInfo.STATUS_ID = tmp[5];
+                packetInfo.CHANGED_TIME = tmp[6];
+                packetInfo.SEND_TIME = tmp[17];
+                updateStatus(packetInfo);
+                break;
+            case 0x0813:// A607 Driver ID Update
+                Utils.log('Got A607 Driver ID Update');
+                packetInfo.DRIVER_ID = tmp[5];
+                packetInfo.DRIVER_ID_CHANGED_TIME = tmp[6];
+                packetInfo.SEND_TIME = tmp[17];
+                updateDriverID(packetInfo);
+                break;
+            case 0x0802:// Set Driver Status List Text Receipt Report
+                Utils.log('Got Driver Status List Receipt');
+                packetInfo.STATUS_ID = tmp[5];
+                packetInfo.RESULT = tmp[6];
+                Utils.log((packetInfo.RESULT === 1) ? 'SUCCESS' : 'FAIL');
+                break;
+            case 0x0261:// Communication Link Status Report
+                Utils.log('Got Communication Link Report');
+                packetInfo.LINK_STATUS = tmp[6];
+                Utils.log('Link Status: ' + (packetInfo.LINK_STATUS === 1 ? 'Established' : 'Lost'));
+                break;
+            case 0x0020:// Text Message ACK Report
+                // TODO write Text Message ACK Report hander here
+                Utils.log('Got Text Message ACK Report');
+                break;
+            case 0x0026:// A607 Client to Server Text Message
+                // TODO write A607 Client to Server Text Message handler here
+                Utils.log('Got A607 Client to Server Text Message');
+                break;
+            case 0x002B:// A604 Text Message Receipt Report
+                // TODO write A604 Text Message Receipt Report  handler here
+                Utils.log('Got A604 Text Message Receipt Report');
+                packetInfo.MESSAGE_ID = tmp[5];
+                packetInfo.WRITE_STATUS = tmp[6];
+                packetInfo.SEND_TIME = tmp[17];
+                updateSentMessageStatus(packetInfo);
+                break;
+            case 0x0041:// Text Message Status Report 
+                // TODO write Text Message Status Report handler here
+                Utils.log('Got Text Message Status Report ');
+                break;
+            case 0x0211:// Stop Status Report
+                Utils.log('Got Stop Status Report');
+                packetInfo.STOP_ID = tmp[5];
+                packetInfo.STOP_STATUS = tmp[6];
+                packetInfo.SEND_TIME = tmp[17];
+                updateStopStatus(packetInfo);
+                break;
 //TODO create the handling function of below Garmin Packet IDs
-        case 0x0029:// Canned Response list receipt report
-        case 0x002B:// A604 Text Message Receipt Report
-        case 0x0032:// Set Canned Response Receipt Report
-        case 0x0033:// Delete Canned Response Receipt Reeport
-        case 0x0034:// Refresh Canned Response List Text Report
-        case 0x0051:// Set Cannned Message Receipt Report
-        case 0x0053:// Delete Canned Message Receipt Report
-        case 0x0054:// Refresh Canned Message List Report
-        case 0x0111:// Sort Stop List Acknowledgement Report
+            case 0x0029:// Canned Response list receipt report
+            case 0x002B:// A604 Text Message Receipt Report
+            case 0x0032:// Set Canned Response Receipt Report
+            case 0x0033:// Delete Canned Response Receipt Reeport
+            case 0x0034:// Refresh Canned Response List Text Report
+            case 0x0051:// Set Cannned Message Receipt Report
+            case 0x0053:// Delete Canned Message Receipt Report
+            case 0x0054:// Refresh Canned Message List Report
+            case 0x0111:// Sort Stop List Acknowledgement Report
 
-        case 0x0241:// User Interface Text Receipt Report
+            case 0x0241:// User Interface Text Receipt Report
 
-        case 0x0253:// Request Message Throttling Status Report
-        case 0x0260:// Ping Packet Report
+            case 0x0253:// Request Message Throttling Status Report
+            case 0x0260:// Ping Packet Report
 
-        case 0x0803:// Delete Driver Status List Text Receipt Report
-        case 0x0804:// Refresh Driver Status List Report
-        case 0x0812:// Set Driver ID Receipt Report
-        case 0x1001:// Set Speed Limit Alert Receipt Report
-        case 0x0251:// Set Message Throttling Response Report
+            case 0x0803:// Delete Driver Status List Text Receipt Report
+            case 0x0804:// Refresh Driver Status List Report
+            case 0x0812:// Set Driver ID Receipt Report
+            case 0x1001:// Set Speed Limit Alert Receipt Report
+            case 0x0251:// Set Message Throttling Response Report
 
-        default:
-            console.error('Unhandled Packet Type : 0x' + tmp[4]);
-            break;
+            default:
+                console.error('Unhandled Packet Type : 0x' + tmp[4]);
+                break;
+        }
+    } else {
+        console.error("Error: Unknown packet data type: " + tmp[0]);
     }
 
     if (callback) {
@@ -183,6 +205,7 @@ function dataPacketHandler(message, remoteInfo, callback) {
         return packetInfo;
     }
 }
+
 /**
  * Connect a PostgreSQL Server and Query
  * pass the error and result to the callback function
@@ -191,7 +214,7 @@ function dataPacketHandler(message, remoteInfo, callback) {
  * @returns {error|ResultSet} error and result of the process
  */
 function pg_connectAndQuery(sql, callback) {
-    var client = new pg.Client(connectionInfo);
+    var client = new pg.Client(ConnectionInfo);
     client.connect(function(error) {
         if (error) {
             client.end();
@@ -270,8 +293,6 @@ function updateDriverID(packetInfo) {
     pg_connectAndQuery(sql, function(error, result) {
         // nothing to do :D
     });
-
-
 }
 
 
@@ -316,19 +337,69 @@ function updateStatus(packetInfo) {
             });
         }
     });
-
 }
 
 function updateStopStatus(packetInfo) {
-    var sql = "UPDATE stop_points SET status=" + packetInfo.STOP_STATUS + ", last_update=to_timestamp(" + packetInfo.SEND_TIME + ") WHERE point_id=" + packetInfo.STOP_ID + " AND imei='" + packetInfo.IMEI + "';";
+    var sql = "SELECT status FROM stop_points WHERE point_id=" + packetInfo.STOP_ID + " AND imei='" + packetInfo.IMEI + "' LIMIT 1;";
     pg_connectAndQuery(sql, function(error, result) {
-        if (error) {
-            sql = "INSERT INTO stop_points(point_id, imei, lat, lon, description, status, last_update) VALUES (  " + packetInfo.STOP_ID + ", " + packetInfo.IMEI + ", -1, -1, 'GARMIN LIST', " + packetInfo.STOP_STATUS + ", to_timestamp(" + packetInfo.SEND_TIME + "));";
+        if (!result.rows[0]) {
+            sql = "INSERT INTO stop_points(point_id, imei, lat, lon, description, status, last_update, last_status) VALUES (  " + packetInfo.STOP_ID + ", " + packetInfo.IMEI + ", -1, -1, 'GARMIN LIST', " + packetInfo.STOP_STATUS + ", to_timestamp('" + packetInfo.SEND_TIME + "','YYYYMMDDHH24MISS') + interval '7 hour',-1);";
             pg_connectAndQuery(sql, function(error, result) {
             });
+        } else if (result.rows[0].status === '104') {
+            var sql = "UPDATE stop_points SET status=" + packetInfo.STOP_STATUS + ", last_update=to_timestamp('" + packetInfo.SEND_TIME + "','YYYYMMDDHH24MISS')+ interval '7 hour' WHERE point_id=" + packetInfo.STOP_ID + " AND imei='" + packetInfo.IMEI + "';";
+        } else {
+            var sql = "UPDATE stop_points SET last_status=status, status=" + packetInfo.STOP_STATUS + ", last_update=to_timestamp('" + packetInfo.SEND_TIME + "','YYYYMMDDHH24MISS')+ interval '7 hour' WHERE point_id=" + packetInfo.STOP_ID + " AND imei='" + packetInfo.IMEI + "';";
         }
     });
+
+
 }
+
+
+function sendFirstQueuedCommand(imei) {
+    if (!imei)
+        return;
+    var sql = "SELECT *  FROM command_queue WHERE imei='" + imei + "'  ORDER BY addtime ASC LIMIT 1;";
+    pg_connectAndQuery(sql, function(error, result) {
+        if (error) {
+            console.error(error);
+            return error;
+        }
+        if (!result.rows[0])
+            return;
+        var row = result.rows[0].command;
+        dataIDArray[imei].sql_id = result.rows[0].command_id;
+        if (dataIDArray[imei].packet_id === 65535) {
+            dataIDArray[imei].packet_id = 1;
+        }
+        var hexNum = padding((dataIDArray[imei].packet_id).toString(16).toUpperCase());
+        var message = new Buffer(row.replace('{packetID}', hexNum));
+        console.log('Sending Queued Command!!!');
+        console.log(message.toString());
+        var sendSock = datagram.createSocket('udp4');
+        sendSock.send(message, 0, message.length, GatewayInfo.port, GatewayInfo.address, function(err, bytes) {
+            console.log("error: " + err + " | bytes: " + bytes);
+            sendSock.close();
+        });
+
+
+    });
+}
+
+function padding(hex) {
+    while (hex.length < 4) {
+        hex = '0' + hex;
+    }
+    return hex;
+}
+
+function deleteSentQueuedCommand(command_id) {
+    var sql = "DELETE FROM command_queue WHERE command_id = " + command_id + ";";
+    pg_connectAndQuery(sql, function(error, result) {
+    });
+}
+
 
 
 //TODO continue on updateSentMessage Later
@@ -338,5 +409,4 @@ function updateSentMessageStatus(packetInfo) {
 //    pg_connectAndQuery(sql, function(error, result) {
 //        
 //    });
-
 }
