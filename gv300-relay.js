@@ -12,14 +12,11 @@ var ConnectionInfo = {
     host: 'localhost',
     port: 5432
 };
-
 var GatewayInfo = {
     address: '58.64.30.187',
     port: 30170
 };
-
 var dataIDArray = new Array();
-
 //--------------------- Main Entry ----------------------
 var socket = datagram.createSocket('udp4');
 socket.on('error', function(error) {
@@ -30,6 +27,7 @@ socket.on('message', function(msg, rInfo) {
     console.log('');
     var message = msg.toString();
     Utils.log(message);
+    increaseRecvData(msg);
     dataPacketHandler(message, rInfo, function(result) {
         //console.log(result);
     });
@@ -68,7 +66,6 @@ function dataPacketHandler(message, remoteInfo, callback) {
     packetInfo.HEX = parseInt(tmp[4], 16);
     packetInfo.IMEI = tmp[2];
     pg_log(packetInfo.IMEI, message);
-
     // - - DEV - - packet viewer - - - - -
     for (var i = 0; i < tmp.length; i++) {
         console.log(i + ' : ' + tmp[i]);
@@ -115,7 +112,17 @@ function dataPacketHandler(message, remoteInfo, callback) {
                     dataIDArray[packetInfo.IMEI].sql_id = 0;
                 }
                 sendFirstQueuedCommand(packetInfo.IMEI);
-
+                break;
+            case 0x0001:
+                // Device Information Report
+                Utils.log('Got Device Information Packet');
+                packetInfo.PROTOCOL_VERSION = tmp[1];
+                packetInfo.ESN = tmp[5];
+                packetInfo.PRODUCT_ID = tmp[6];
+                packetInfo.SOFTWARE_VERSION = tmp[7];
+                packetInfo.SUPPORT_PROTOCOLS = tmp[8];
+                packetInfo.SEND_TIME = tmp[13];
+                updateGarminInfo(packetInfo);
                 break;
             case 0x0823:// Set Driver Status Receipt Report
                 Utils.log('Got Driver Status Update');
@@ -135,12 +142,15 @@ function dataPacketHandler(message, remoteInfo, callback) {
                 Utils.log('Got Driver Status List Receipt');
                 packetInfo.STATUS_ID = tmp[5];
                 packetInfo.RESULT = tmp[6];
-                Utils.log((packetInfo.RESULT === 1) ? 'SUCCESS' : 'FAIL');
+                Utils.log((packetInfo.RESULT === '1') ? 'SUCCESS' : 'FAIL');
                 break;
             case 0x0261:// Communication Link Status Report
                 Utils.log('Got Communication Link Report');
                 packetInfo.LINK_STATUS = tmp[6];
-                Utils.log('Link Status: ' + (packetInfo.LINK_STATUS === 1 ? 'Established' : 'Lost'));
+                packetInfo.SEND_TIME = tmp[17];
+                Utils.log('Link Status: ' + (packetInfo.LINK_STATUS === '1' ? 'Established' : 'Lost'));
+                updateLinkStatatus(packetInfo);
+                sendFirstQueuedCommand(packetInfo.IMEI);
                 break;
             case 0x0020:// Text Message ACK Report
                 // TODO write Text Message ACK Report hander here
@@ -148,7 +158,15 @@ function dataPacketHandler(message, remoteInfo, callback) {
                 break;
             case 0x0026:// A607 Client to Server Text Message
                 // TODO write A607 Client to Server Text Message handler here
+                packetInfo.MESSAGE_ID = tmp[5];
+                packetInfo.LONGITUDE = tmp[8];
+                packetInfo.LATITUDE = tmp[9];
+                packetInfo.MESSAGE = tmp[6];
+                packetInfo.REPLY_ID = tmp[7];
+                packetInfo.SEND_TIME = tmp[19];
+
                 Utils.log('Got A607 Client to Server Text Message');
+                storeReceivedMessage(packetInfo);
                 break;
             case 0x002B:// A604 Text Message Receipt Report
                 // TODO write A604 Text Message Receipt Report  handler here
@@ -278,6 +296,19 @@ function updateBoxInfo(packetInfo) {
                     Utils.log('Driver Info Update: Success');
                 }
             });
+            if (!r.rows[0].protocol_version) {
+                //queueUpCommand(packetInfo.IMEI, "AT+GTFMI=gv300,2,,,,,{packetID}\$");
+                var command = "%CMDFWD%|" + packetInfo.IMEI + "|ABC1234|" + timeStamp() + "|'AT+GTFMI=gv300,2,,,,,FFFF$'";
+                var message = new Buffer(command);
+                var sendSock = datagram.createSocket('udp4');
+                sendSock.send(message, 0, message.length, GatewayInfo.port, GatewayInfo.address, function(err, bytes) {
+                    sendSock.close();
+                });
+
+
+            }
+
+
         }
     });
 }
@@ -341,21 +372,100 @@ function updateStatus(packetInfo) {
 
 function updateStopStatus(packetInfo) {
     var sql = "SELECT status FROM stop_points WHERE point_id=" + packetInfo.STOP_ID + " AND imei='" + packetInfo.IMEI + "' LIMIT 1;";
+    console.log(sql);
     pg_connectAndQuery(sql, function(error, result) {
         if (!result.rows[0]) {
             sql = "INSERT INTO stop_points(point_id, imei, lat, lon, description, status, last_update, last_status) VALUES (  " + packetInfo.STOP_ID + ", " + packetInfo.IMEI + ", -1, -1, 'GARMIN LIST', " + packetInfo.STOP_STATUS + ", to_timestamp('" + packetInfo.SEND_TIME + "','YYYYMMDDHH24MISS') + interval '7 hour',-1);";
-            pg_connectAndQuery(sql, function(error, result) {
-            });
+            console.log(sql);
         } else if (result.rows[0].status === '104') {
-            var sql = "UPDATE stop_points SET status=" + packetInfo.STOP_STATUS + ", last_update=to_timestamp('" + packetInfo.SEND_TIME + "','YYYYMMDDHH24MISS')+ interval '7 hour' WHERE point_id=" + packetInfo.STOP_ID + " AND imei='" + packetInfo.IMEI + "';";
+            sql = "UPDATE stop_points SET status=" + packetInfo.STOP_STATUS + ", last_update=to_timestamp('" + packetInfo.SEND_TIME + "','YYYYMMDDHH24MISS')+ interval '7 hour' WHERE point_id=" + packetInfo.STOP_ID + " AND imei='" + packetInfo.IMEI + "';";
         } else {
-            var sql = "UPDATE stop_points SET last_status=status, status=" + packetInfo.STOP_STATUS + ", last_update=to_timestamp('" + packetInfo.SEND_TIME + "','YYYYMMDDHH24MISS')+ interval '7 hour' WHERE point_id=" + packetInfo.STOP_ID + " AND imei='" + packetInfo.IMEI + "';";
+            sql = "UPDATE stop_points SET last_status=status, status=" + packetInfo.STOP_STATUS + ", last_update=to_timestamp('" + packetInfo.SEND_TIME + "','YYYYMMDDHH24MISS')+ interval '7 hour' WHERE point_id=" + packetInfo.STOP_ID + " AND imei='" + packetInfo.IMEI + "';";
         }
+        pg_connectAndQuery(sql, function(error, result) {
+            console.error(error);
+        });
+    });
+}
+
+function updateLinkStatatus(packetInfo) {
+    var status = packetInfo.LINK_STATUS === '1' ? 'TRUE' : 'FALSE';
+    var sql_update = "UPDATE boxes SET link_status = '" + status + "', last_update=to_timestamp('" + packetInfo.SEND_TIME + "','YYYYMMDDHH24MISS')+ interval '7 hour'\n\
+         WHERE imei= '" + packetInfo.IMEI + "' ;";
+    pg_connectAndQuery(sql_update, function(error, result) {
+    });
+
+}
+
+
+function updateGarminInfo(packetInfo) {
+//    packetInfo.PROTOCOL_VERSION = tmp[1];
+//    packetInfo.ESN = tmp[5];
+//    packetInfo.PRODUCT_ID[6];
+//    packetInfo.SOFTWARE_VERSION = tmp[7];
+//    packetInfo.SUPPORT_PROTOCOLS = tmp[8];
+//    packetInfo.SEND_TIME = tmp[13];
+
+    var sql = "UPDATE boxes SET protocol_version='" + packetInfo.PROTOCOL_VERSION + "',\n\
+    esn='" + packetInfo.ESN + "',\n\
+    product_id = '" + packetInfo.PRODUCT_ID + "',\n\
+    software_version='" + packetInfo.SOFTWARE_VERSION + "',\n\
+    support_protocols='" + packetInfo.SUPPORT_PROTOCOLS + "'\n\
+    WHERE imei = '" + packetInfo.IMEI + "';";
+    pg_connectAndQuery(sql, function(error, result) {
     });
 
 
 }
 
+function increaseRecvData(bytes) {
+    var packetSize = bytes.length;
+    var mesg = bytes.toString().split(',');
+    var imei = mesg[2];
+    var sql_insert = "INSERT INTO data_stats(imei, received, last_update, start_date)\n\
+                        VALUES ('" + imei + "', " + packetSize + ", now(), now());";
+    var sql_update = "UPDATE data_stats SET received=received+" + packetSize + ",last_update=now() WHERE imei='" + imei + "'";
+
+    pg_connectAndQuery(sql_insert, function(error, result) {
+        if (error) {
+            pg_connectAndQuery(sql_update, function(error, result) {
+            });
+        }
+    });
+
+}
+function increaseSentData(imei, bytes) {
+    var packetSize = bytes.length;
+    var sql_insert = "INSERT INTO data_stats(imei, sent, last_update, start_date)\n\
+                        VALUES ('" + imei + "', " + packetSize + ", now(), now());";
+
+    var sql_update = "UPDATE data_stats SET sent=sent+" + packetSize + ",last_update=now() WHERE imei='" + imei + "'";
+    pg_connectAndQuery(sql_insert, function(error, result) {
+        if (error) {
+            pg_connectAndQuery(sql_update, function(error, result) {
+            });
+        }
+    });
+
+}
+
+
+function queueUpCommand(imei, cmd) {
+    var command = "%CMDFWD%|" + imei + "|ABC1234|" + timeStamp() + "|'" + cmd + "'";
+    var sql = "INSERT INTO command_queue (addtime,imei,command) VALUES (now(),$1,$2);";
+    var client = new pg.Client(ConnectionInfo);
+    client.connect(function(error) {
+        if (error) {
+            client.end();
+            return  error;
+        }
+        client.query(sql, [imei, command], function(error, result) {
+            client.end();
+        });
+
+    });
+
+}
 
 function sendFirstQueuedCommand(imei) {
     if (!imei)
@@ -370,20 +480,22 @@ function sendFirstQueuedCommand(imei) {
             return;
         var row = result.rows[0].command;
         dataIDArray[imei].sql_id = result.rows[0].command_id;
-        if (dataIDArray[imei].packet_id === 65535) {
+        if (dataIDArray[imei].packet_id >= 65535) {
             dataIDArray[imei].packet_id = 1;
         }
         var hexNum = padding((dataIDArray[imei].packet_id).toString(16).toUpperCase());
         var message = new Buffer(row.replace('{packetID}', hexNum));
-        console.log('Sending Queued Command!!!');
-        console.log(message.toString());
+        Utils.log('Sending Queued Command: ' + message.toString());
+        var stringMessage = message.toString();
+
+        var msg = stringMessage.substring(stringMessage.indexOf("'") + 1, stringMessage.lastIndexOf("'"));
+        var realBytes = Buffer(msg);
+        increaseSentData(imei, realBytes);
         var sendSock = datagram.createSocket('udp4');
         sendSock.send(message, 0, message.length, GatewayInfo.port, GatewayInfo.address, function(err, bytes) {
             console.log("error: " + err + " | bytes: " + bytes);
             sendSock.close();
         });
-
-
     });
 }
 
@@ -405,8 +517,36 @@ function deleteSentQueuedCommand(command_id) {
 //TODO continue on updateSentMessage Later
 function updateSentMessageStatus(packetInfo) {
     // TODO cont. here
-    var sql = "UPDATE sent_message SET message_write_status=" + packetInfo.WRITE_STATUS + ", last_update=to_timestamp('" + packetInfo.SEND_TIME + "','YYYYMMDDHH24MISS')+ interval '7 hour'  , WHERE imei='" + packetInfo.IMEI + "';";
-//    pg_connectAndQuery(sql, function(error, result) {
-//        
-//    });
+
+}
+
+// TODO store the receive message
+function storeReceivedMessage(packetInfo) {
+    if(packetInfo.REPLY_ID==='')
+        packetInfo.REPLY_ID = 'independent';
+    var insert = "INSERT INTO recv_messages (imei,lat,lon,reply_id,message,last_update,message_id) \n\
+    VALUES ('" + packetInfo.IMEI + "'," + packetInfo.LATITUDE + " ," + packetInfo.LONGITUDE + ",'" + packetInfo.REPLY_ID + "','" + packetInfo.MESSAGE + "', to_timestamp('" + packetInfo.SEND_TIME + "','YYYYMMDDHH24MISS')+ interval '7 hour', '"+packetInfo.MESSAGE_ID+" ' );";
+    console.log(insert);
+    pg_connectAndQuery(insert, function(error, result) {
+        if(error){
+            console.error(error);
+        }
+    });
+}
+
+/**
+ * Timestamp in 'Y-m-d H:i:s' format
+ * @returns {String}
+ */
+function timeStamp() {
+    //$time = date('Y-m-d H:i:s');
+    var d = new Date();
+    var timeString = "";
+    timeString += d.getFullYear();
+    timeString += '-' + (d.getMonth() > 10 ? d.getMonth() : '0' + d.getMonth());
+    timeString += '-' + (d.getDate() > 10 ? d.getDate() : '0' + d.getDate());
+    timeString += ' ' + (d.getHours() > 10 ? d.getHours() : '0' + d.getHours());
+    timeString += ":" + (d.getMinutes() > 10 ? d.getMinutes() : '0' + d.getMinutes());
+    timeString += ":" + (d.getSeconds() > 10 ? d.getSeconds() : '0' + d.getSeconds());
+    return timeString;
 }
